@@ -50,6 +50,8 @@ room-<unique room ID>: {
 	mjrs_dir = "/path/to/" (path to save the mjr files to)
 	allow_rtp_participants = true|false (whether participants should be allowed to join
 		via plain RTP as well, rather than just WebRTC, default=false)
+	allow_ws_participants = true|false (whether participants should be allowed to join
+		via core RTP-over-WebSocket media, rather than just WebRTC, default=false)
 	groups = optional, non-hierarchical, array of groups to tag participants, for external forwarding purposes only
 
 		[The following lines are only needed if you want the mixed audio
@@ -155,6 +157,7 @@ room-<unique room ID>: {
 	"mjrs" : <true|false (whether all participants in the room should be individually recorded to mjr files, default=false)>,
 	"mjrs_dir" : "</path/to/, optional>",
 	"allow_rtp_participants" : <true|false, whether participants should be allowed to join via plain RTP as well, default=false>,
+	"allow_ws_participants" : <true|false, whether participants should be allowed to join via RTP-over-WebSocket as well, default=false>,
 	"groups" : [ non-hierarchical array of string group names to use to gat participants, for external forwarding purposes only, optional]
 }
 \endverbatim
@@ -1242,6 +1245,7 @@ room-<unique room ID>: {
 #include "../sdp-utils.h"
 #include "../utils.h"
 #include "../ip-utils.h"
+#include "../rtpws.h"
 
 
 /* Plugin information */
@@ -1272,6 +1276,12 @@ void janus_audiobridge_create_session(janus_plugin_session *handle, int *error);
 struct janus_plugin_result *janus_audiobridge_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep);
 json_t *janus_audiobridge_handle_admin_message(json_t *message);
 void janus_audiobridge_setup_media(janus_plugin_session *handle);
+static gboolean janus_audiobridge_rtp_ws_join_requested(json_t *msg) {
+	json_t *media = json_object_get(msg, "media");
+	return media && json_is_string(media) &&
+		!strcasecmp(json_string_value(media), "websocket");
+}
+
 void janus_audiobridge_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp *packet);
 void janus_audiobridge_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rtcp *packet);
 void janus_audiobridge_hangup_media(janus_plugin_session *handle);
@@ -1358,6 +1368,7 @@ static struct janus_json_parameter create_parameters[] = {
 	{"mjrs", JANUS_JSON_BOOL, 0},
 	{"mjrs_dir", JSON_STRING, 0},
 	{"allow_rtp_participants", JANUS_JSON_BOOL, 0},
+	{"allow_ws_participants", JANUS_JSON_BOOL, 0},
 	{"permanent", JANUS_JSON_BOOL, 0},
 	{"audiolevel_ext", JANUS_JSON_BOOL, 0},
 	{"audiolevel_event", JANUS_JSON_BOOL, 0},
@@ -1549,6 +1560,7 @@ typedef struct janus_audiobridge_room {
 	volatile gint wav_header_added;	/* If wav header is added in recording file */
 	gint64 rec_start_time;		/* Time when recording started for generating file name */
 	gboolean allow_plainrtp;	/* Whether plain RTP participants are allowed*/
+	gboolean allow_wsmedia;		/* Whether WebSocket media participants are allowed */
 	gboolean destroy;			/* Value to flag the room for destruction */
 	GHashTable *participants;	/* Map of participants */
 	GHashTable *anncs;			/* Map of announcements */
@@ -1804,6 +1816,8 @@ typedef struct janus_audiobridge_participant {
 	/* Plain RTP, in case this is not a WebRTC participant */
 	gboolean plainrtp;			/* Whether this is a WebRTC participant, or a plain RTP one */
 	janus_audiobridge_plainrtp_media plainrtp_media;
+	gboolean wsmedia;			/* Whether this is a WebSocket media participant */
+	janus_rtp_ws_peer *rtp_ws_peer;
 	janus_mutex pmutex;
 	janus_mutex encoding_mutex;	/* Encoding mutex to lock encoder instance */
 	janus_mutex decoding_mutex;	/* Decoding mutex to lock decoder instance */
@@ -1832,6 +1846,24 @@ typedef struct janus_audiobridge_participant {
 	volatile gint destroyed;	/* Whether this participant has been destroyed */
 	janus_refcount ref;			/* Reference counter for this participant */
 } janus_audiobridge_participant;
+
+static void janus_audiobridge_rtp_ws_incoming(janus_rtp_ws_peer *peer, char *buffer, int len) {
+	if(!peer || !peer->user_data)
+		return;
+	janus_audiobridge_session *session = (janus_audiobridge_session *)peer->user_data;
+	if(!session || !session->handle)
+		return;
+	janus_plugin_rtp packet = { .video = FALSE, .buffer = buffer, .length = (uint16_t)len };
+	janus_plugin_rtp_extensions_reset(&packet.extensions);
+	janus_audiobridge_incoming_rtp(session->handle, &packet);
+}
+
+static void janus_audiobridge_rtp_ws_detach(janus_audiobridge_participant *participant) {
+	if(!participant || !participant->rtp_ws_peer)
+		return;
+	janus_rtp_ws_peer_destroy(participant->rtp_ws_peer);
+	participant->rtp_ws_peer = NULL;
+}
 
 typedef struct janus_audiobridge_rtp_relay_packet {
 	janus_rtp_header *data;
@@ -1952,6 +1984,7 @@ static void janus_audiobridge_participant_free(const janus_refcount *participant
 #ifdef HAVE_LIBOGG
 	janus_audiobridge_file_free(participant->annc);
 #endif
+	janus_audiobridge_rtp_ws_detach(participant);
 	janus_mutex_lock(&participant->pmutex);
 	janus_audiobridge_plainrtp_media_cleanup(&participant->plainrtp_media);
 	janus_mutex_unlock(&participant->pmutex);
@@ -2691,6 +2724,7 @@ int janus_audiobridge_init(janus_callbacks *callback, const char *config_path) {
 			janus_config_item *mjrs = janus_config_get(config, cat, janus_config_type_item, "mjrs");
 			janus_config_item *mjrsdir = janus_config_get(config, cat, janus_config_type_item, "mjrs_dir");
 			janus_config_item *allowrtp = janus_config_get(config, cat, janus_config_type_item, "allow_rtp_participants");
+			janus_config_item *allowws = janus_config_get(config, cat, janus_config_type_item, "allow_ws_participants");
 			if(sampling == NULL || sampling->value == NULL) {
 				JANUS_LOG(LOG_ERR, "Can't add the AudioBridge room, missing mandatory information...\n");
 				cl = cl->next;
@@ -2837,6 +2871,9 @@ int janus_audiobridge_init(janus_callbacks *callback, const char *config_path) {
 			audiobridge->allow_plainrtp = FALSE;
 			if(allowrtp && allowrtp->value)
 				audiobridge->allow_plainrtp = janus_is_true(allowrtp->value);
+			audiobridge->allow_wsmedia = FALSE;
+			if(allowws && allowws->value)
+				audiobridge->allow_wsmedia = janus_is_true(allowws->value);
 			audiobridge->destroy = 0;
 			audiobridge->participants = g_hash_table_new_full(
 				string_ids ? g_str_hash : g_int64_hash, string_ids ? g_str_equal : g_int64_equal,
@@ -3286,6 +3323,7 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 		json_t *mjrs = json_object_get(root, "mjrs");
 		json_t *mjrsdir = json_object_get(root, "mjrs_dir");
 		json_t *allowrtp = json_object_get(root, "allow_rtp_participants");
+		json_t *allowws = json_object_get(root, "allow_ws_participants");
 		json_t *permanent = json_object_get(root, "permanent");
 		if(allowed) {
 			/* Make sure the "allowed" array only contains strings */
@@ -3493,6 +3531,9 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 		audiobridge->allow_plainrtp = FALSE;
 		if(allowrtp && json_is_true(allowrtp))
 			audiobridge->allow_plainrtp = TRUE;
+		audiobridge->allow_wsmedia = FALSE;
+		if(allowws && json_is_true(allowws))
+			audiobridge->allow_wsmedia = TRUE;
 		audiobridge->destroy = 0;
 		audiobridge->participants = g_hash_table_new_full(
 			string_ids ? g_str_hash : g_int64_hash, string_ids ? g_str_equal : g_int64_equal,
@@ -6485,7 +6526,10 @@ static void janus_audiobridge_hangup_media_internal(janus_plugin_session *handle
 			res = write(participant->plainrtp_media.pipefd[1], &code, sizeof(int));
 		} while(res == -1 && errno == EINTR);
 	}
+	if(participant->wsmedia)
+		janus_audiobridge_rtp_ws_detach(participant);
 	participant->plainrtp = FALSE;
+	participant->wsmedia = FALSE;
 	janus_mutex_lock(&rooms_mutex);
 	janus_audiobridge_room *audiobridge = participant->room;
 	gboolean removed = FALSE;
@@ -6671,6 +6715,13 @@ static void *janus_audiobridge_handler(void *data) {
 					json_object_del(root, "rtp");
 				}
 			}
+			if(rtp != NULL && janus_audiobridge_rtp_ws_join_requested(root)) {
+				janus_mutex_unlock(&sessions_mutex);
+				error_code = JANUS_AUDIOBRIDGE_ERROR_INVALID_ELEMENT;
+				JANUS_LOG(LOG_ERR, "Cannot join with both rtp and media=websocket\n");
+				g_snprintf(error_cause, 512, "Cannot join with both rtp and media=websocket");
+				goto error;
+			}
 			if(!string_ids) {
 				JANUS_VALIDATE_JSON_OBJECT(root, room_parameters,
 					error_code, error_cause, TRUE,
@@ -6729,6 +6780,16 @@ static void *janus_audiobridge_handler(void *data) {
 				error_code = JANUS_AUDIOBRIDGE_ERROR_UNAUTHORIZED;
 				JANUS_LOG(LOG_ERR, "Plain RTP participants not allowed in this room\n");
 				g_snprintf(error_cause, 512, "Plain RTP participants not allowed in this room");
+				goto error;
+			}
+			if(janus_audiobridge_rtp_ws_join_requested(root) && !audiobridge->allow_wsmedia) {
+				/* WebSocket media participants are not allowed in this room */
+				janus_mutex_unlock(&audiobridge->mutex);
+				janus_refcount_decrease(&audiobridge->ref);
+				janus_mutex_unlock(&sessions_mutex);
+				error_code = JANUS_AUDIOBRIDGE_ERROR_UNAUTHORIZED;
+				JANUS_LOG(LOG_ERR, "WebSocket media participants not allowed in this room\n");
+				g_snprintf(error_cause, 512, "WebSocket media participants not allowed in this room");
 				goto error;
 			}
 			/* Signed tokens are enforced, so they precede any pin validation */
@@ -7072,6 +7133,47 @@ static void *janus_audiobridge_handler(void *data) {
 				generate_offer = json_is_true(gen_offer);
 			if(generate_offer)
 				session->plugin_offer = generate_offer;
+			json_t *wsmedia_join_json = NULL;
+			if(janus_audiobridge_rtp_ws_join_requested(root)) {
+				if(!janus_rtp_ws_is_available()) {
+					error_code = 499;
+					g_snprintf(error_cause, 512, "%s", janus_rtp_ws_compile_error());
+					janus_mutex_unlock(&audiobridge->mutex);
+					janus_refcount_decrease(&audiobridge->ref);
+					janus_mutex_unlock(&sessions_mutex);
+					goto error;
+				}
+				if(!janus_rtp_ws_is_enabled() || !audiobridge->allow_wsmedia) {
+					error_code = 489;
+					g_snprintf(error_cause, 512,
+						"WebSocket media not allowed (enable rtpws::enable_rtp_ws and allow_ws_participants on room)");
+					janus_mutex_unlock(&audiobridge->mutex);
+					janus_refcount_decrease(&audiobridge->ref);
+					janus_mutex_unlock(&sessions_mutex);
+					goto error;
+				}
+				participant->rtp_ws_peer = janus_rtp_ws_peer_create(session,
+					janus_audiobridge_rtp_ws_incoming, NULL, "opus",
+					audiobridge->sampling_rate > 0 ? audiobridge->sampling_rate : 48000,
+					1, 20, 100);
+				if(!participant->rtp_ws_peer) {
+					error_code = 499;
+					g_snprintf(error_cause, 512, "Failed to allocate WebSocket media session");
+					janus_mutex_unlock(&audiobridge->mutex);
+					janus_refcount_decrease(&audiobridge->ref);
+					janus_mutex_unlock(&sessions_mutex);
+					goto error;
+				}
+				char *url = janus_rtp_ws_peer_build_url(participant->rtp_ws_peer);
+				if(url) {
+					wsmedia_join_json = json_object();
+					json_object_set_new(wsmedia_join_json, "url", json_string(url));
+					g_free(url);
+				}
+				participant->wsmedia = TRUE;
+				participant->plainrtp = FALSE;
+				generate_offer = FALSE;
+			}
 			/* If this is a plain RTP participant, create the socket */
 			if(rtp != NULL) {
 				participant->plainrtp = TRUE;
@@ -7280,6 +7382,10 @@ static void *janus_audiobridge_handler(void *data) {
 					json_object_set_new(details, "payload_type", json_integer(participant->codec == JANUS_AUDIOCODEC_PCMA ? 8 : 0));
 				json_object_set_new(event, "rtp", details);
 			}
+			if(wsmedia_join_json) {
+				json_object_set_new(event, "websocket_media", wsmedia_join_json);
+				wsmedia_join_json = NULL;
+			}
 			/* Also notify event handlers */
 			if(notify_events && gateway->events_is_enabled()) {
 				json_t *info = json_object();
@@ -7300,6 +7406,9 @@ static void *janus_audiobridge_handler(void *data) {
 			if(participant->plainrtp && (!session->plugin_offer || participant->plainrtp_media.audio_send) &&
 					g_atomic_int_compare_and_exchange(&participant->plainrtp_media.initialized, 0, 1)) {
 				/* Plain RTP participant, simulate a setup_media event */
+				janus_audiobridge_setup_media(session->handle);
+			} else if(participant->wsmedia) {
+				/* WebSocket media participant, simulate a setup_media event */
 				janus_audiobridge_setup_media(session->handle);
 			}
 		} else if(!strcasecmp(request_text, "configure")) {
@@ -9477,6 +9586,8 @@ static void janus_audiobridge_relay_rtp_packet(gpointer data, gpointer user_data
 				JANUS_LOG(LOG_WARN, "Error sending plain RTP packet: %d (%s)\n", errno, g_strerror(errno));
 			}
 		}
+	} else if(participant->wsmedia && participant->rtp_ws_peer) {
+		janus_rtp_ws_peer_send_rtp(participant->rtp_ws_peer, (char *)packet->data, packet->length);
 	} else if(gateway != NULL) {
 		janus_plugin_rtp rtp = { .mindex = -1, .video = FALSE, .buffer = (char *)packet->data, .length = packet->length };
 		janus_plugin_rtp_extensions_reset(&rtp.extensions);
