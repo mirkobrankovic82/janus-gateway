@@ -23,6 +23,8 @@ rtpws: {
 - Room allows WS participants (`allow_ws_participants = true`, or let the CLI create the room with that flag)
 - HMAC token if `token_auth_secret` is configured (`export TOKEN=...`)
 
+Join with `"codec": "opus"` (default), `"pcma"`, or `"pcmu"`; the WebSocket `call_info` frame reports the negotiated payload type and sample rate.
+
 ## Build
 
 ```bash
@@ -46,17 +48,30 @@ export JANUS_HTTP=http://127.0.0.1:8088/janus
 export TOKEN=your-hmac-token   # if token auth is enabled
 export ROOM=ws-audio-test
 
-# Signaling only
+# Signaling only (Opus WS leg)
 go run . signaling --janus-http "$JANUS_HTTP" --token "$TOKEN" --room "$ROOM" --media websocket
 
-# WS bidirectional (auto-join)
+# G.711 A-law over WebSocket
+go run . ws-stream --janus-http "$JANUS_HTTP" --token "$TOKEN" --room "$ROOM" --codec pcma --tone --expect-rx 50
+
+# WS bidirectional (auto-join, default Opus)
 go run . ws-stream --janus-http "$JANUS_HTTP" --token "$TOKEN" --room "$ROOM" --tone --expect-rx 50
 
 # Full outbound mix test: plain-RTP talks, WS leg receives mix
 go run . ws-e2e --janus-http "$JANUS_HTTP" --token "$TOKEN" --room "$ROOM" --local-ip 127.0.0.1 --expect-rx 50
 ```
 
-`ws-stream` also accepts `--ws-url` directly if you already have a `websocket_media.url` from a prior join.
+`ws-stream` also accepts `--ws-url` directly if you already have a `websocket_media.url` from a prior join. Use `--codec` when auto-joining via `--janus-http` (also available as `CODEC` env var).
+
+### Codecs
+
+| `--codec` | RTP PT | Sample rate | Notes |
+|-----------|--------|-------------|-------|
+| `opus` (default) | 100 | 48 kHz (room rate) | Tone uses placeholder payload bytes (connectivity test) |
+| `pcma` | 8 | 8 kHz | G.711 A-law encoded 440 Hz tone |
+| `pcmu` | 0 | 8 kHz | G.711 μ-law encoded 440 Hz tone |
+
+After connecting to the WebSocket media URL, read the JSON `call_info` text frame and match its `payload_type`, `sample_rate`, and `codec` when sending binary RTP.
 
 ### Bidirectional checks
 

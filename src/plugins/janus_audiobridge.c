@@ -981,6 +981,26 @@ room-<unique room ID>: {
  * "dials out" (e.g., for outgoing INVITES to SIP endpoints) check the
  * \ref aboffer section.
  *
+ * As an alternative to plain RTP, participants can also join using the
+ * core RTP-over-WebSocket transport by adding \c media set to \c websocket
+ * to the \c join request (the room must have \c allow_ws_participants set
+ * to true, and \c rtpws::enable_rtp_ws must be enabled in the core).
+ * The \c codec property in the join request (opus, pcma or pcmu) selects
+ * the RTP payload type and sample rate advertised to the client in the
+ * \c call_info JSON frame sent on the WebSocket after connect. Binary
+ * WebSocket frames must contain full RTP packets matching those parameters.
+ * A successful join will include a \c websocket_media object:
+ *
+\verbatim
+{
+	"audiobridge" : "joined",
+	[..]
+	"websocket_media" : {
+		"url" : "<WebSocket URL to connect to for binary RTP, e.g. ws://host:8190/rtp-ws?sid=...>"
+	}
+}
+\endverbatim
+ *
  * At this point, whether the participant will be interacting via WebRTC
  * or plain RTP, the media-related settings of the participant can be
  * modified by means of a \c configure request. The \c configure request
@@ -1846,6 +1866,23 @@ typedef struct janus_audiobridge_participant {
 	volatile gint destroyed;	/* Whether this participant has been destroyed */
 	janus_refcount ref;			/* Reference counter for this participant */
 } janus_audiobridge_participant;
+
+static void janus_audiobridge_rtp_ws_media_params(janus_audiobridge_participant *participant,
+		janus_audiobridge_room *audiobridge, const char **codec_name,
+		int *sample_rate, int *payload_type) {
+	const char *name = janus_audiocodec_name(participant->codec);
+	int rate = 8000;
+	int pt = janus_audiocodec_pt(participant->codec);
+	if(participant->codec == JANUS_AUDIOCODEC_OPUS) {
+		rate = audiobridge->sampling_rate > 0 ? audiobridge->sampling_rate : 48000;
+		if(participant->opus_pt == 0)
+			participant->opus_pt = 100;
+		pt = participant->opus_pt;
+	}
+	*codec_name = name;
+	*sample_rate = rate;
+	*payload_type = pt;
+}
 
 static void janus_audiobridge_rtp_ws_incoming(janus_rtp_ws_peer *peer, char *buffer, int len) {
 	if(!peer || !peer->user_data)
@@ -7152,10 +7189,13 @@ static void *janus_audiobridge_handler(void *data) {
 					janus_mutex_unlock(&sessions_mutex);
 					goto error;
 				}
+				const char *ws_codec_name = NULL;
+				int ws_sample_rate = 0, ws_payload_type = 0;
+				janus_audiobridge_rtp_ws_media_params(participant, audiobridge,
+					&ws_codec_name, &ws_sample_rate, &ws_payload_type);
 				participant->rtp_ws_peer = janus_rtp_ws_peer_create(session,
-					janus_audiobridge_rtp_ws_incoming, NULL, "opus",
-					audiobridge->sampling_rate > 0 ? audiobridge->sampling_rate : 48000,
-					1, 20, 100);
+					janus_audiobridge_rtp_ws_incoming, NULL, ws_codec_name,
+					ws_sample_rate, 1, 20, ws_payload_type);
 				if(!participant->rtp_ws_peer) {
 					error_code = 499;
 					g_snprintf(error_cause, 512, "Failed to allocate WebSocket media session");
