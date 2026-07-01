@@ -1,5 +1,5 @@
 /*! \file    rtpws.h
- * \author   Lorenzo Miniero <lorenzo@meetecho.com>
+ * \author   Mirko Brankovic <mirkobrankovic@gmail.com>
  * \copyright GNU General Public License v3
  * \brief    RTP over WebSocket support (headers)
  * \details  Integration of RTP over WebSocket functionality in the
