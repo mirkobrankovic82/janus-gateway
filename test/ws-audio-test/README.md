@@ -56,7 +56,17 @@ go run . ws-stream --janus-http "$JANUS_HTTP" --token "$TOKEN" --room "$ROOM" --
 go run . ws-e2e --janus-http "$JANUS_HTTP" --token "$TOKEN" --room "$ROOM" --local-ip 127.0.0.1 --expect-rx 50
 ```
 
-`ws-stream` also accepts `--ws-url` directly if you already have a `websocket_media.url` from a prior join.
+`ws-stream` also accepts `--ws-url` directly if you already have a `websocket_media.url` from a prior join. Use `--codec` when auto-joining via `--janus-http` (also available as `CODEC` env var).
+
+### Codecs
+
+| `--codec` | RTP PT | Sample rate | Notes |
+|-----------|--------|-------------|-------|
+| `opus` (default) | 100 | room rate | Placeholder tone payload (connectivity test) |
+| `l16` | 106 | 16 kHz | L16/16000 big-endian PCM tone (room `sampling_rate` must be 16000) |
+| `l16-48` | 105 | 48 kHz | L16/48000 big-endian PCM tone (room `sampling_rate` must be 48000) |
+
+After connecting to the WebSocket media URL, read the JSON `call_info` text frame and match its `payload_type`, `sample_rate`, and `codec` when sending binary RTP.
 
 ### Bidirectional checks
 
