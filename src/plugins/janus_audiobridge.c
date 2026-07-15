@@ -1265,6 +1265,7 @@ room-<unique room ID>: {
 #include "../sdp-utils.h"
 #include "../utils.h"
 #include "../ip-utils.h"
+#include "../ice.h"
 #include "../rtpws.h"
 
 
@@ -1890,6 +1891,7 @@ static void janus_audiobridge_rtp_ws_incoming(janus_rtp_ws_peer *peer, char *buf
 	janus_audiobridge_session *session = (janus_audiobridge_session *)peer->user_data;
 	if(!session || !session->handle)
 		return;
+	janus_plugin_session_touch(session->handle);
 	janus_plugin_rtp packet = { .video = FALSE, .buffer = buffer, .length = (uint16_t)len };
 	janus_plugin_rtp_extensions_reset(&packet.extensions);
 	janus_audiobridge_incoming_rtp(session->handle, &packet);
@@ -9627,6 +9629,7 @@ static void janus_audiobridge_relay_rtp_packet(gpointer data, gpointer user_data
 			}
 		}
 	} else if(participant->wsmedia && participant->rtp_ws_peer) {
+		janus_plugin_session_touch(session->handle);
 		janus_rtp_ws_peer_send_rtp(participant->rtp_ws_peer, (char *)packet->data, packet->length);
 	} else if(gateway != NULL) {
 		janus_plugin_rtp rtp = { .mindex = -1, .video = FALSE, .buffer = (char *)packet->data, .length = packet->length };
