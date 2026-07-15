@@ -639,6 +639,7 @@ static janus_callbacks janus_handler_plugin =
 		.send_remb = janus_plugin_send_remb,
 		.close_pc = janus_plugin_close_pc,
 		.end_session = janus_plugin_end_session,
+		.touch_session = janus_plugin_session_touch,
 		.events_is_enabled = janus_events_is_enabled,
 		.notify_event = janus_plugin_notify_event,
 		.auth_is_signed = janus_plugin_auth_is_signed,
