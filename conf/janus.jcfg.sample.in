@@ -63,10 +63,12 @@ general: {
 									# a valid token in all requests. Useful if
 									# you want to authenticate requests from web
 									# users.
-	#token_auth_secret = "janus"	# Use HMAC-SHA1 signed tokens (with token_auth). Note that
+	#token_auth_secret = "janus"	# Use HMAC signed tokens (with token_auth). Note that
 									# without this, the Admin API MUST
 									# be enabled, as tokens are added and removed
 									# through messages sent there.
+	#token_auth_hash = "sha1"		# Hash function used for signed-token authentication.
+									# Defaults to sha1. Supported values: sha1, sha256.
 	admin_secret = "janusoverlord"	# String that all Janus requests must contain
 									# to be accepted/authorized by the admin/monitor.
 									# only needed if you enabled the admin API
@@ -274,6 +276,17 @@ media: {
 	# https://tools.ietf.org/html/draft-ietf-tsvwg-rtcweb-qos-18#page-6
 	# That said, DON'T TOUCH THIS IF YOU DON'T KNOW WHAT IT MEANS!
 	#dscp = 46
+
+	# By default the 'rtp_port_range' configured above (if any) is shared by all
+	# PeerConnections. If you want to let clients confine a single handle to a
+	# narrower sub-range, you can set the 'rtp_port_range_perhandle_override'
+	# property to true: when enabled, an 'attach' request may provide optional
+	# 'min_port' and 'max_port' properties to restrict that handle's RTP/RTCP
+	# ports. The requested range is confined within the global 'rtp_port_range'
+	# above: a range that falls outside it is ignored and the global range is
+	# used instead. When this is disabled (the default), the 'min_port' and
+	# 'max_port' properties are ignored, so the existing behavior is preserved.
+	#rtp_port_range_perhandle_override = false
 }
 
 # RTP-over-WebSocket support: a core media transport plugins can use to
