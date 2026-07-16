@@ -48,7 +48,8 @@ const char *janus_rtp_ws_compile_error(void) {
 #ifndef HAVE_WEBSOCKETS
 
 int janus_rtp_ws_init(gboolean enabled, uint16_t port, const char *path, const char *public_url,
-		gboolean secure, const char *cert_pem, const char *cert_key, const char *cert_pwd) {
+		gboolean secure, const char *cert_pem, const char *cert_key, const char *cert_pwd,
+		const char *server_name, gboolean allow_ws_bind) {
 	(void)port;
 	(void)path;
 	(void)public_url;
@@ -56,6 +57,8 @@ int janus_rtp_ws_init(gboolean enabled, uint16_t port, const char *path, const c
 	(void)cert_pem;
 	(void)cert_key;
 	(void)cert_pwd;
+	(void)server_name;
+	(void)allow_ws_bind;
 	if(enabled) {
 		JANUS_LOG(LOG_ERR, "[RTP-WS] %s\n", janus_rtp_ws_compile_error());
 		return -1;
@@ -109,8 +112,10 @@ static volatile int rtp_ws_running = 0;
 static volatile int rtp_ws_delivery_running = 0;
 static char rtp_ws_path[128] = "/rtp-ws";
 static char rtp_ws_public_url[256] = "";
+static char rtp_ws_server_name[256] = "";
 static uint16_t rtp_ws_listen_port = 8190;
 static gboolean rtp_ws_listen_secure = FALSE;
+static gboolean rtp_ws_allow_bind = FALSE;
 static GHashTable *rtp_ws_peers_by_sid = NULL;
 static janus_mutex rtp_ws_peers_mutex = JANUS_MUTEX_INITIALIZER;
 
@@ -306,23 +311,128 @@ static const char *janus_rtp_ws_urlarg(struct lws *wsi, const char *name, char *
 	return (val[0] != '\0') ? val : NULL;
 }
 
-static void janus_rtp_ws_send_call_info(struct lws *wsi, janus_rtp_ws_peer *peer) {
-	json_t *info = json_object();
-	json_object_set_new(info, "type", json_string("call_info"));
-	json_object_set_new(info, "codec", json_string(peer->codec_name ? peer->codec_name : "opus"));
-	json_object_set_new(info, "sample_rate", json_integer(peer->sample_rate > 0 ? peer->sample_rate : 48000));
-	json_object_set_new(info, "channels", json_integer(peer->channels > 0 ? peer->channels : 1));
-	json_object_set_new(info, "ptime_ms", json_integer(peer->ptime_ms > 0 ? peer->ptime_ms : 20));
-	json_object_set_new(info, "payload_type", json_integer(peer->payload_type > 0 ? peer->payload_type : 100));
+static void janus_rtp_ws_send_json(struct lws *wsi, json_t *info) {
+	if(!info)
+		return;
 	char *txt = json_dumps(info, JSON_COMPACT);
 	json_decref(info);
 	if(!txt)
 		return;
 	size_t len = strlen(txt);
 	unsigned char buf[LWS_PRE + 512];
+	if(len > 512) {
+		free(txt);
+		return;
+	}
 	memcpy(&buf[LWS_PRE], txt, len);
 	lws_write(wsi, &buf[LWS_PRE], len, LWS_WRITE_TEXT);
 	free(txt);
+}
+
+static void janus_rtp_ws_send_call_info(struct lws *wsi, janus_rtp_ws_peer *peer) {
+	json_t *info = json_object();
+	json_object_set_new(info, "type", json_string("call_info"));
+	if(rtp_ws_server_name[0])
+		json_object_set_new(info, "server-name", json_string(rtp_ws_server_name));
+	json_object_set_new(info, "codec", json_string(peer->codec_name ? peer->codec_name : "opus"));
+	json_object_set_new(info, "sample_rate", json_integer(peer->sample_rate > 0 ? peer->sample_rate : 48000));
+	json_object_set_new(info, "channels", json_integer(peer->channels > 0 ? peer->channels : 1));
+	json_object_set_new(info, "ptime_ms", json_integer(peer->ptime_ms > 0 ? peer->ptime_ms : 20));
+	json_object_set_new(info, "payload_type", json_integer(peer->payload_type > 0 ? peer->payload_type : 100));
+	janus_rtp_ws_send_json(wsi, info);
+}
+
+/* Sent right after a peerless (browser-first) connection is established so the
+ * client learns which gateway pod it landed on before requesting a bind/join. */
+static void janus_rtp_ws_send_server_hello(struct lws *wsi) {
+	json_t *info = json_object();
+	json_object_set_new(info, "type", json_string("server_info"));
+	if(rtp_ws_server_name[0])
+		json_object_set_new(info, "server-name", json_string(rtp_ws_server_name));
+	janus_rtp_ws_send_json(wsi, info);
+}
+
+static void janus_rtp_ws_send_error(struct lws *wsi, const char *code, const char *reason) {
+	json_t *info = json_object();
+	json_object_set_new(info, "type", json_string("error"));
+	json_object_set_new(info, "code", json_string(code ? code : "error"));
+	if(reason)
+		json_object_set_new(info, "reason", json_string(reason));
+	janus_rtp_ws_send_json(wsi, info);
+}
+
+/* Attach an already-open connection to a peer (shared by the legacy ?sid= path
+ * and the browser-first bind path). Returns 0 on success, -1 if unavailable. */
+static int janus_rtp_ws_attach_peer(janus_rtp_ws_connection *conn, struct lws *wsi, janus_rtp_ws_peer *peer) {
+	if(!conn || !peer)
+		return -1;
+	conn->peer = peer;
+	conn->wsi = wsi;
+	janus_rtp_ws_peer_extra *extra = janus_rtp_ws_extra_get(peer);
+	if(extra) {
+		janus_mutex_lock(&extra->mutex);
+		extra->wsi = wsi;
+		janus_mutex_unlock(&extra->mutex);
+		janus_rtp_ws_request_writable(extra);
+	}
+	janus_rtp_ws_send_call_info(wsi, peer);
+	return 0;
+}
+
+/* Handle a text control frame on a (possibly peerless) connection. Only used
+ * when rtp_ws_allow_bind is on. Currently supports "bind" (attach an existing
+ * sid created by AudioBridge signaling); "join" is reserved for a future
+ * ws-initiated AudioBridge join. */
+static void janus_rtp_ws_handle_control(janus_rtp_ws_connection *conn, struct lws *wsi,
+		const char *text, size_t len) {
+	if(!conn || !text || len == 0)
+		return;
+	json_error_t jerr;
+	json_t *root = json_loadb(text, len, 0, &jerr);
+	if(!root || !json_is_object(root)) {
+		if(root)
+			json_decref(root);
+		janus_rtp_ws_send_error(wsi, "bad_request", "invalid JSON control frame");
+		return;
+	}
+	json_t *type = json_object_get(root, "type");
+	const char *action = json_is_string(type) ? json_string_value(type) : NULL;
+	if(action && !strcmp(action, "bind")) {
+		if(conn->peer) {
+			janus_rtp_ws_send_error(wsi, "already_bound", "connection already bound");
+			json_decref(root);
+			return;
+		}
+		json_t *sidj = json_object_get(root, "sid");
+		const char *sid = json_is_string(sidj) ? json_string_value(sidj) : NULL;
+		if(!sid || sid[0] == '\0') {
+			janus_rtp_ws_send_error(wsi, "bad_request", "bind requires sid");
+			json_decref(root);
+			return;
+		}
+		janus_rtp_ws_peer *peer = janus_rtp_ws_lookup(sid);
+		if(!peer || g_atomic_int_get(&peer->destroyed)) {
+			if(peer)
+				janus_rtp_ws_peer_unref(peer);
+			JANUS_LOG(LOG_WARN, "[RTP-WS] bind rejected: unknown sid (%s)\n", sid);
+			janus_rtp_ws_send_error(wsi, "unknown_sid", "no such session on this pod");
+			json_decref(root);
+			return;
+		}
+		/* lookup() took a reference; attach transfers it to conn (freed on CLOSED). */
+		janus_rtp_ws_attach_peer(conn, wsi, peer);
+		JANUS_LOG(LOG_VERB, "[RTP-WS] bound connection to sid %s\n", sid);
+		json_decref(root);
+		return;
+	}
+	if(action && !strcmp(action, "join")) {
+		/* Reserved: ws-initiated AudioBridge join (Path 2), not implemented yet. */
+		janus_rtp_ws_send_error(wsi, "not_supported", "ws-initiated join not enabled");
+		json_decref(root);
+		return;
+	}
+	janus_rtp_ws_send_error(wsi, "bad_request", "unknown control type");
+	json_decref(root);
 }
 
 static int janus_rtp_ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
@@ -334,6 +444,13 @@ static int janus_rtp_ws_callback(struct lws *wsi, enum lws_callback_reasons reas
 			char sidbuf[64] = {0};
 			const char *sid = janus_rtp_ws_urlarg(wsi, "sid", sidbuf, sizeof(sidbuf));
 			if(!sid || sid[0] == '\0') {
+				/* Browser-first: accept a peerless upgrade and bind the sid later
+				 * over the WS. Legacy behaviour (reject) stays when disabled. */
+				if(rtp_ws_allow_bind) {
+					conn->peer = NULL;
+					conn->wsi = wsi;
+					return 0;
+				}
 				JANUS_LOG(LOG_WARN, "[RTP-WS] WebSocket upgrade rejected: missing sid query parameter\n");
 				return -1;
 			}
@@ -358,10 +475,18 @@ static int janus_rtp_ws_callback(struct lws *wsi, enum lws_callback_reasons reas
 					janus_rtp_ws_request_writable(extra);
 				}
 				janus_rtp_ws_send_call_info(wsi, conn->peer);
+			} else if(conn && rtp_ws_allow_bind) {
+				/* Peerless (browser-first): announce which pod the client reached
+				 * so it can create the sid here and bind it. */
+				janus_rtp_ws_send_server_hello(wsi);
 			}
 			break;
 		case LWS_CALLBACK_RECEIVE:
-			if(conn && conn->peer && lws_frame_is_binary(wsi)) {
+			if(!conn)
+				break;
+			if(lws_frame_is_binary(wsi)) {
+				if(!conn->peer)
+					break;
 				if(len < 12 || len > RTP_WS_MAX_RTP)
 					break;
 				if(!janus_is_rtp((char *)in, (int)len))
@@ -374,7 +499,11 @@ static int janus_rtp_ws_callback(struct lws *wsi, enum lws_callback_reasons reas
 				pkt->len = (int)len;
 				memcpy(pkt->data, in, len);
 				g_async_queue_push(rtp_ws_in_queue, pkt);
+				break;
 			}
+			/* Text control frame (browser-first bind/join); ignored unless enabled. */
+			if(rtp_ws_allow_bind)
+				janus_rtp_ws_handle_control(conn, wsi, (const char *)in, len);
 			break;
 		case LWS_CALLBACK_SERVER_WRITEABLE:
 			janus_rtp_ws_flush_writable(conn, wsi);
@@ -430,7 +559,8 @@ static void *janus_rtp_ws_delivery_thread(void *data) {
 }
 
 int janus_rtp_ws_init(gboolean enabled, uint16_t port, const char *path, const char *public_url,
-		gboolean secure, const char *cert_pem, const char *cert_key, const char *cert_pwd) {
+		gboolean secure, const char *cert_pem, const char *cert_key, const char *cert_pwd,
+		const char *server_name, gboolean allow_ws_bind) {
 	rtp_ws_enabled = FALSE;
 	if(!enabled)
 		return 0;
@@ -439,8 +569,11 @@ int janus_rtp_ws_init(gboolean enabled, uint16_t port, const char *path, const c
 		g_snprintf(rtp_ws_path, sizeof(rtp_ws_path), "%s", path);
 	if(public_url && *public_url)
 		g_snprintf(rtp_ws_public_url, sizeof(rtp_ws_public_url), "%s", public_url);
+	if(server_name && *server_name)
+		g_snprintf(rtp_ws_server_name, sizeof(rtp_ws_server_name), "%s", server_name);
 	rtp_ws_listen_port = port;
 	rtp_ws_listen_secure = secure;
+	rtp_ws_allow_bind = allow_ws_bind;
 
 	if(rtp_ws_context)
 		return 0;
@@ -497,8 +630,10 @@ int janus_rtp_ws_init(gboolean enabled, uint16_t port, const char *path, const c
 	}
 
 	rtp_ws_enabled = TRUE;
-	JANUS_LOG(LOG_INFO, "[RTP-WS] RTP over WebSocket enabled (%s, port %u, path %s)\n",
-		secure ? "WSS" : "WS", rtp_ws_listen_port, rtp_ws_path);
+	JANUS_LOG(LOG_INFO, "[RTP-WS] RTP over WebSocket enabled (%s, port %u, path %s, ws-bind %s, server-name %s)\n",
+		secure ? "WSS" : "WS", rtp_ws_listen_port, rtp_ws_path,
+		rtp_ws_allow_bind ? "on" : "off",
+		rtp_ws_server_name[0] ? rtp_ws_server_name : "(unset)");
 	return 0;
 }
 

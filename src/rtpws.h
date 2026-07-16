@@ -32,9 +32,12 @@
  * @param[in] cert_pem Certificate PEM path for WSS
  * @param[in] cert_key Certificate key PEM path for WSS
  * @param[in] cert_pwd Optional password for the certificate key
+ * @param[in] server_name Gateway server-name advertised to clients in the call_info handshake
+ * @param[in] allow_ws_bind Whether to accept browser-first connect-then-bind (see rtpws::allow_ws_bind)
  * @returns 0 in case of success, a negative integer on errors */
 int janus_rtp_ws_init(gboolean enabled, uint16_t port, const char *path, const char *public_url,
-	gboolean secure, const char *cert_pem, const char *cert_key, const char *cert_pwd);
+	gboolean secure, const char *cert_pem, const char *cert_key, const char *cert_pwd,
+	const char *server_name, gboolean allow_ws_bind);
 /*! \brief RTP-over-WebSocket code de-initialization */
 void janus_rtp_ws_deinit(void);
 /*! \brief Whether RTP-over-WS was enabled in the configuration */
