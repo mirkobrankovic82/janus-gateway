@@ -5545,8 +5545,13 @@ gint main(int argc, char *argv[]) {
 		if(item && item->value)
 			rtp_ws_cert_pwd = item->value;
 	}
+	gboolean rtp_ws_allow_bind = FALSE;
+	item = janus_config_get(config, config_rtpws, janus_config_type_item, "allow_ws_bind");
+	if(item && item->value)
+		rtp_ws_allow_bind = janus_is_true(item->value);
 	if(janus_rtp_ws_init(enable_rtp_ws, rtp_ws_port, rtp_ws_path, rtp_ws_public_url,
-			rtp_ws_secure, rtp_ws_cert_pem, rtp_ws_cert_key, rtp_ws_cert_pwd) < 0) {
+			rtp_ws_secure, rtp_ws_cert_pem, rtp_ws_cert_key, rtp_ws_cert_pwd,
+			server_name, rtp_ws_allow_bind) < 0) {
 		janus_options_destroy();
 		exit(1);
 	}

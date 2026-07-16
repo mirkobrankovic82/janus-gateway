@@ -289,6 +289,12 @@ rtpws: {
 	#cert_pem = "/path/to/certificate.pem"
 	#cert_key = "/path/to/key.pem"
 	#cert_pwd = "secret"
+	# When true, a client may connect without a "?sid=" query param and bind it
+	# later over the WebSocket with a {"type":"bind","sid":"..."} control frame
+	# (browser-first, so the client's connection picks the pod). The peerless
+	# connection first receives a {"type":"server_info","server-name":"..."}
+	# frame naming the pod. When false, only the legacy "?sid=" flow is accepted.
+	#allow_ws_bind = true
 }
 
 # NAT-related stuff: specifically, you can configure the STUN/TURN
