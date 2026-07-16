@@ -71,13 +71,16 @@ Examples:
   go run . ws-e2e --janus-http http://127.0.0.1:8088/janus --token "$TOKEN" --room test1 --local-ip 127.0.0.1
 
 Flags (plain-rtp, ws-stream, ws-e2e, signaling):
-  --codec          Audio codec for join and tone RTP: opus, pcma, or pcmu (default opus)
-  --tone           Send 440Hz RTP payload (PT from codec / server call_info)
-  --expect-rx N    Exit with error if fewer than N RTP packets received (default 0)
+  --codec          Audio codec for join and tone: opus, pcma, pcmu, l16, or l16-48 (default opus)
+  --framing        WS wire framing (ws-stream/ws-e2e): rtp (default) or payload (raw codec payloads)
+  --tone           Send 440Hz payload (PT from codec / server call_info)
+  --expect-rx N    Exit with error if fewer than N media frames received (default 0)
   --stats-interval Print tx/rx counters periodically (default 2s)
 
-Examples with G.711:
+Examples with G.711 / L16 / payload framing:
   go run . ws-stream --janus-http http://127.0.0.1:8088/janus --token "$TOKEN" --room test1 --codec pcma --tone
+  go run . ws-stream --janus-http http://127.0.0.1:8088/janus --token "$TOKEN" --room test1 --codec l16 --tone
+  go run . ws-stream --janus-http http://127.0.0.1:8088/janus --token "$TOKEN" --room test1 --codec pcmu --framing payload --tone
   go run . plain-rtp --janus-http http://127.0.0.1:8088/janus --token "$TOKEN" --room test1 --codec pcmu --local-ip 127.0.0.1 --tone
 
 `)
@@ -117,8 +120,38 @@ func mediaFormatFromName(name string) (mediaFormat, error) {
 			timestampStep: 160,
 			payloadSize:   160,
 		}, nil
+	case "l16":
+		// L16/16000: 16-bit linear PCM, 20ms => 320 samples => 640 bytes.
+		return mediaFormat{
+			codec:         "l16",
+			payloadType:   100,
+			sampleRate:    16000,
+			timestampStep: 320,
+			payloadSize:   640,
+		}, nil
+	case "l16-48":
+		// L16/48000: 16-bit linear PCM, 20ms => 960 samples => 1920 bytes.
+		return mediaFormat{
+			codec:         "l16-48",
+			payloadType:   100,
+			sampleRate:    48000,
+			timestampStep: 960,
+			payloadSize:   1920,
+		}, nil
 	default:
-		return mediaFormat{}, fmt.Errorf("unsupported codec %q (use opus, pcma, or pcmu)", name)
+		return mediaFormat{}, fmt.Errorf("unsupported codec %q (use opus, pcma, pcmu, l16, or l16-48)", name)
+	}
+}
+
+// codecPayloadBytes returns the RTP payload size in bytes for a number of samples.
+func codecPayloadBytes(codec string, samples uint32) int {
+	switch codec {
+	case "opus":
+		return 160
+	case "l16", "l16-48":
+		return int(samples) * 2 // 16-bit samples
+	default:
+		return int(samples) // 1 byte/sample for G.711
 	}
 }
 
@@ -155,16 +188,12 @@ func mediaFormatFromCallInfo(raw []byte) (mediaFormat, error) {
 		samplesPerPacket = base.timestampStep
 	}
 	base.timestampStep = samplesPerPacket
-	if base.codec == "opus" {
-		base.payloadSize = 160
-	} else {
-		base.payloadSize = int(samplesPerPacket)
-	}
+	base.payloadSize = codecPayloadBytes(base.codec, samplesPerPacket)
 	return base, nil
 }
 
 func parseCodecFlag(fs *flag.FlagSet) *string {
-	return fs.String("codec", envOr("CODEC", "opus"), "Audio codec: opus, pcma, or pcmu (env: CODEC)")
+	return fs.String("codec", envOr("CODEC", "opus"), "Audio codec: opus, pcma, pcmu, l16, or l16-48 (env: CODEC)")
 }
 
 type rtpCounters struct {
@@ -349,9 +378,14 @@ type session struct {
 	room     string
 	media    string
 	codec    string
+	framing  string // "rtp" (default) or "payload"
 	localIP  string
 	useTone  bool
 	duration time.Duration
+}
+
+func (s *session) payloadFraming() bool {
+	return strings.EqualFold(s.framing, "payload")
 }
 
 func (s *session) joinCodec() string {
@@ -455,11 +489,13 @@ func (s *session) joinWebSocket() (string, error) {
 		},
 	})
 
+	wsExtra := map[string]any{"media": "websocket"}
+	if s.payloadFraming() {
+		wsExtra["ws_framing"] = "payload"
+	}
 	joinResp, err := s.j.post(handleURL, map[string]any{
 		"janus": "message",
-		"body": s.joinBody("ws-media-test", map[string]any{
-			"media": "websocket",
-		}),
+		"body":  s.joinBody("ws-media-test", wsExtra),
 	})
 	if err != nil {
 		return "", err
@@ -668,10 +704,11 @@ func runWSStream(args []string) {
 	token := fs.String("token", envOr("TOKEN", ""), "HMAC Janus token (env: TOKEN)")
 	room := fs.String("room", envOr("ROOM", "ws-audio-test"), "AudioBridge room id (env: ROOM)")
 	codec := parseCodecFlag(fs)
+	framing := parseFramingFlag(fs)
 	wsURL := fs.String("ws-url", "", "WebSocket media URL (optional if --janus-http is set)")
-	tone := fs.Bool("tone", true, "Send tone as binary RTP frames")
+	tone := fs.Bool("tone", true, "Send tone as binary frames (RTP, or raw payload in payload framing)")
 	duration := fs.Duration("duration", 30*time.Second, "Stream duration")
-	expectRX := fs.Uint64("expect-rx", 0, "Fail if fewer inbound RTP packets received")
+	expectRX := fs.Uint64("expect-rx", 0, "Fail if fewer inbound media frames received")
 	statsInterval := fs.Duration("stats-interval", 2*time.Second, "Stats log interval")
 	_ = fs.Parse(args)
 
@@ -685,7 +722,7 @@ func runWSStream(args []string) {
 		if *janusHTTP == "" {
 			log.Fatal("either --ws-url or --janus-http is required")
 		}
-		s := &session{j: newJanus(*janusHTTP, *token), room: *room, codec: format.codec}
+		s := &session{j: newJanus(*janusHTTP, *token), room: *room, codec: format.codec, framing: *framing}
 		url, err = s.joinWebSocket()
 		if err != nil {
 			log.Fatal("join:", err)
@@ -695,9 +732,13 @@ func runWSStream(args []string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	if err := runWSBidirectional(ctx, url, *tone, format, *duration, *expectRX, *statsInterval, "ws-stream"); err != nil {
+	if err := runWSBidirectional(ctx, url, *tone, format, strings.EqualFold(*framing, "payload"), *duration, *expectRX, *statsInterval, "ws-stream"); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func parseFramingFlag(fs *flag.FlagSet) *string {
+	return fs.String("framing", envOr("FRAMING", "rtp"), "WS wire framing: rtp (full RTP packets) or payload (raw codec payloads) (env: FRAMING)")
 }
 
 func runWSE2E(args []string) {
@@ -707,8 +748,9 @@ func runWSE2E(args []string) {
 	room := fs.String("room", envOr("ROOM", "ws-audio-test"), "AudioBridge room id (env: ROOM)")
 	localIP := fs.String("local-ip", envOr("LOCAL_IP", "127.0.0.1"), "Local IP for plain-RTP feeder (env: LOCAL_IP)")
 	codec := parseCodecFlag(fs)
+	framing := parseFramingFlag(fs)
 	duration := fs.Duration("duration", 30*time.Second, "Test duration")
-	expectRX := fs.Uint64("expect-rx", 50, "Minimum inbound RTP on WS leg (mix from feeder)")
+	expectRX := fs.Uint64("expect-rx", 50, "Minimum inbound media frames on WS leg (mix from feeder)")
 	statsInterval := fs.Duration("stats-interval", 2*time.Second, "Stats log interval")
 	_ = fs.Parse(args)
 
@@ -730,19 +772,19 @@ func runWSE2E(args []string) {
 	var feederCounters rtpCounters
 	go writeToneUDPRTP(ctx, conn, remote, &feederCounters, format, *duration)
 
-	wsSess := &session{j: newJanus(*janusHTTP, *token), room: *room, codec: format.codec}
+	wsSess := &session{j: newJanus(*janusHTTP, *token), room: *room, codec: format.codec, framing: *framing}
 	wsURL, err := wsSess.joinWebSocket()
 	if err != nil {
 		log.Fatal("ws join:", err)
 	}
 
 	time.Sleep(500 * time.Millisecond)
-	if err := runWSBidirectional(ctx, wsURL, false, format, *duration, *expectRX, *statsInterval, "ws-e2e"); err != nil {
+	if err := runWSBidirectional(ctx, wsURL, false, format, strings.EqualFold(*framing, "payload"), *duration, *expectRX, *statsInterval, "ws-e2e"); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func runWSBidirectional(ctx context.Context, wsURL string, sendTone bool, joinFormat mediaFormat, dur time.Duration, expectRX uint64, statsInterval time.Duration, label string) error {
+func runWSBidirectional(ctx context.Context, wsURL string, sendTone bool, joinFormat mediaFormat, payloadFraming bool, dur time.Duration, expectRX uint64, statsInterval time.Duration, label string) error {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
 		Subprotocols:     []string{"janus-rtp-ws"},
@@ -768,17 +810,17 @@ func runWSBidirectional(ctx context.Context, wsURL string, sendTone bool, joinFo
 		log.Printf("[%s] note: joined with codec=%s, server call_info codec=%s",
 			label, joinFormat.codec, streamFormat.codec)
 	}
-	log.Printf("[%s] media codec=%s pt=%d rate=%d step=%d payload=%d B",
+	log.Printf("[%s] media codec=%s pt=%d rate=%d step=%d payload=%d B framing=%s",
 		label, streamFormat.codec, streamFormat.payloadType, streamFormat.sampleRate,
-		streamFormat.timestampStep, streamFormat.payloadSize)
+		streamFormat.timestampStep, streamFormat.payloadSize, framingLabel(payloadFraming))
 
 	var counters rtpCounters
 	go watchStats(ctx, &counters, label, statsInterval)
-	go readWSRTP(ctx, conn, &counters, label)
+	go readWSRTP(ctx, conn, &counters, label, payloadFraming)
 
 	if sendTone {
 		go func() {
-			if err := writeToneWS(ctx, conn, &counters, streamFormat, dur); err != nil && ctx.Err() == nil {
+			if err := writeToneWS(ctx, conn, &counters, streamFormat, payloadFraming, dur); err != nil && ctx.Err() == nil {
 				log.Printf("[%s] tx error: %v", label, err)
 			}
 		}()
@@ -831,7 +873,14 @@ func readUDPRTP(ctx context.Context, conn *net.UDPConn, c *rtpCounters, label st
 	}
 }
 
-func readWSRTP(ctx context.Context, conn *websocket.Conn, c *rtpCounters, label string) {
+func framingLabel(payloadFraming bool) string {
+	if payloadFraming {
+		return "payload"
+	}
+	return "rtp"
+}
+
+func readWSRTP(ctx context.Context, conn *websocket.Conn, c *rtpCounters, label string, payloadFraming bool) {
 	var lastSeq uint16
 	var haveSeq bool
 	for {
@@ -853,6 +902,19 @@ func readWSRTP(ctx context.Context, conn *websocket.Conn, c *rtpCounters, label 
 		}
 		if mt != websocket.BinaryMessage {
 			log.Printf("[%s] rx text: %s", label, string(data))
+			continue
+		}
+		if payloadFraming {
+			// Raw codec payload: no RTP header to parse, just count it.
+			if len(data) == 0 {
+				c.rxBad.Add(1)
+				continue
+			}
+			c.rxPkts.Add(1)
+			c.rxBytes.Add(uint64(len(data)))
+			if c.rxPkts.Load()%50 == 1 {
+				log.Printf("[%s] rx payload %d B", label, len(data))
+			}
 			continue
 		}
 		if !accountRTP(data, c, &lastSeq, &haveSeq) {
@@ -893,7 +955,11 @@ func accountRTP(data []byte, c *rtpCounters, lastSeq *uint16, haveSeq *bool) boo
 }
 
 func writeToneUDPRTP(ctx context.Context, conn *net.UDPConn, remote net.UDPAddr, c *rtpCounters, format mediaFormat, dur time.Duration) error {
-	return writeToneRTP(ctx, format, dur, func(raw []byte) error {
+	return writeToneRTP(ctx, format, dur, func(pkt *rtp.Packet) error {
+		raw, err := pkt.Marshal()
+		if err != nil {
+			return err
+		}
 		n, err := conn.WriteToUDP(raw, &remote)
 		if err != nil {
 			return err
@@ -904,18 +970,28 @@ func writeToneUDPRTP(ctx context.Context, conn *net.UDPConn, remote net.UDPAddr,
 	})
 }
 
-func writeToneWS(ctx context.Context, conn *websocket.Conn, c *rtpCounters, format mediaFormat, dur time.Duration) error {
-	return writeToneRTP(ctx, format, dur, func(raw []byte) error {
-		if err := conn.WriteMessage(websocket.BinaryMessage, raw); err != nil {
+func writeToneWS(ctx context.Context, conn *websocket.Conn, c *rtpCounters, format mediaFormat, payloadFraming bool, dur time.Duration) error {
+	return writeToneRTP(ctx, format, dur, func(pkt *rtp.Packet) error {
+		// In payload framing the wire carries the raw codec payload only; the
+		// gateway synthesizes the RTP header on the way in.
+		out := pkt.Payload
+		if !payloadFraming {
+			raw, err := pkt.Marshal()
+			if err != nil {
+				return err
+			}
+			out = raw
+		}
+		if err := conn.WriteMessage(websocket.BinaryMessage, out); err != nil {
 			return err
 		}
 		c.txPkts.Add(1)
-		c.txBytes.Add(uint64(len(raw)))
+		c.txBytes.Add(uint64(len(out)))
 		return nil
 	})
 }
 
-func writeToneRTP(ctx context.Context, format mediaFormat, dur time.Duration, send func([]byte) error) error {
+func writeToneRTP(ctx context.Context, format mediaFormat, dur time.Duration, send func(*rtp.Packet) error) error {
 	payloadSize := format.payloadSize
 	if payloadSize <= 0 {
 		payloadSize = 160
@@ -949,11 +1025,7 @@ func writeToneRTP(ctx context.Context, format mediaFormat, dur time.Duration, se
 			fillTonePayload(pkt.Payload, format, &phase)
 			pkt.Header.SequenceNumber++
 			pkt.Header.Timestamp += step
-			raw, err := pkt.Marshal()
-			if err != nil {
-				return err
-			}
-			if err := send(raw); err != nil {
+			if err := send(pkt); err != nil {
 				return err
 			}
 		}
@@ -976,6 +1048,14 @@ func fillTonePayload(payload []byte, format mediaFormat, phase *float64) {
 		for i := range payload {
 			pcm := int16(math.Sin(*phase) * 3000)
 			payload[i] = linearToMulaw(pcm)
+			*phase += 2 * math.Pi * 440 / rate
+		}
+	case "l16", "l16-48":
+		// 16-bit big-endian PCM samples (RFC 3551 L16 is network byte order).
+		for i := 0; i+1 < len(payload); i += 2 {
+			pcm := int16(math.Sin(*phase) * 3000)
+			payload[i] = byte(uint16(pcm) >> 8)
+			payload[i+1] = byte(uint16(pcm))
 			*phase += 2 * math.Pi * 440 / rate
 		}
 	default:

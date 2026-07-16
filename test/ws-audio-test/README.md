@@ -23,7 +23,7 @@ rtpws: {
 - Room allows WS participants (`allow_ws_participants = true`, or let the CLI create the room with that flag)
 - HMAC token if `token_auth_secret` is configured (`export TOKEN=...`)
 
-Join with `"codec": "opus"` (default), `"pcma"`, or `"pcmu"`; the WebSocket `call_info` frame reports the negotiated payload type and sample rate.
+Join with `"codec": "opus"` (default), `"pcma"`, `"pcmu"`, `"l16"` (L16/16000), or `"l16-48"` (L16/48000); the WebSocket `call_info` frame reports the negotiated payload type, sample rate, and `framing`.
 
 ## Build
 
@@ -70,8 +70,28 @@ go run . ws-e2e --janus-http "$JANUS_HTTP" --token "$TOKEN" --room "$ROOM" --loc
 | `opus` (default) | 100 | 48 kHz (room rate) | Tone uses placeholder payload bytes (connectivity test) |
 | `pcma` | 8 | 8 kHz | G.711 A-law encoded 440 Hz tone |
 | `pcmu` | 0 | 8 kHz | G.711 μ-law encoded 440 Hz tone |
+| `l16` | dynamic | 16 kHz | 16-bit big-endian linear PCM; room `sampling_rate` must be 16000 |
+| `l16-48` | dynamic | 48 kHz | 16-bit big-endian linear PCM; room `sampling_rate` must be 48000 |
 
 After connecting to the WebSocket media URL, read the JSON `call_info` text frame and match its `payload_type`, `sample_rate`, and `codec` when sending binary RTP.
+
+### Framing (`--framing`)
+
+By default the WS wire carries **full RTP packets** (`--framing rtp`). Pass `--framing payload` to
+join with `"ws_framing": "payload"`: the wire then carries **raw codec payloads** with no RTP header.
+The gateway strips the RTP header outbound and synthesizes one inbound. This is meant for external
+AI/STT/TTS clients that don't want to parse or emit RTP. Combine with `--codec l16`/`l16-48` for
+plain linear PCM that most providers accept directly.
+
+```bash
+# Raw G.711 payloads over WS (no RTP header on the wire)
+go run . ws-stream --janus-http "$JANUS_HTTP" --token "$TOKEN" --room "$ROOM" \
+  --codec pcmu --framing payload --tone --expect-rx 50
+
+# Raw L16/16000 PCM payloads (ideal for STT/TTS)
+go run . ws-stream --janus-http "$JANUS_HTTP" --token "$TOKEN" --room "$ROOM" \
+  --codec l16 --framing payload --tone --expect-rx 50
+```
 
 ### Bidirectional checks
 
@@ -96,6 +116,6 @@ go run . ws-stream \
 
 ## Protocol
 
-1. **Signaling**: normal Janus API — `join` with `"media": "websocket"`; AudioBridge returns `websocket_media.url`.
-2. **Media**: connect to that URL; server sends JSON `call_info` (text frame).
-3. Client and server exchange **binary** WebSocket frames containing full RTP packets (12+ bytes).
+1. **Signaling**: normal Janus API — `join` with `"media": "websocket"` (optionally `"ws_framing": "payload"`); AudioBridge returns `websocket_media.url`.
+2. **Media**: connect to that URL; server sends JSON `call_info` (text frame) including `framing`.
+3. Client and server exchange **binary** WebSocket frames: full RTP packets (12+ bytes) in `rtp` framing, or raw codec payloads in `payload` framing.

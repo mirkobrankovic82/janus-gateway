@@ -5,7 +5,8 @@
  * \details  Integration of RTP over WebSocket functionality in the
  * Janus core, as a feature that plugins can leverage. Plugins register
  * peers (opaque bindings) that clients connect to via WS/WSS; binary
- * frames carry full RTP packets in both directions.
+ * frames carry full RTP packets in both directions, or raw codec payloads
+ * when the peer is created in payload-only framing mode.
  *
  * Notice the functionality documented here is only available if Janus was
  * built with libwebsockets support (--enable-websockets).
@@ -67,6 +68,16 @@ typedef struct janus_rtp_ws_peer {
 	int channels;
 	int ptime_ms;
 	int payload_type;
+	/*! \brief Framing on the wire: FALSE = full RTP packets (default), TRUE = raw
+	 * codec payloads (no RTP header). Payload mode is meant for external AI/STT/TTS
+	 * clients that don't want to parse or emit RTP; the core strips the header on
+	 * the way out and synthesizes one on the way in. */
+	gboolean payload_only;
+	/*! \brief RTP header state synthesized for inbound raw payloads (payload mode only) */
+	guint32 synth_ssrc;
+	guint16 synth_seq;
+	guint32 synth_ts;
+	gboolean synth_started;
 	janus_rtp_ws_incoming_rtp_cb incoming_rtp;
 	janus_rtp_ws_client_gone_cb client_gone;
 	/*! \brief Atomic flag to check if this instance has been destroyed */
@@ -84,10 +95,12 @@ typedef struct janus_rtp_ws_peer {
  * @param[in] channels Number of channels
  * @param[in] ptime_ms Packet time in ms
  * @param[in] payload_type RTP payload type
+ * @param[in] payload_only If TRUE, exchange raw codec payloads instead of full RTP packets
  * @returns A valid peer instance, or NULL on errors */
 janus_rtp_ws_peer *janus_rtp_ws_peer_create(void *user_data,
 	janus_rtp_ws_incoming_rtp_cb incoming_rtp, janus_rtp_ws_client_gone_cb client_gone,
-	const char *codec_name, int sample_rate, int channels, int ptime_ms, int payload_type);
+	const char *codec_name, int sample_rate, int channels, int ptime_ms, int payload_type,
+	gboolean payload_only);
 /*! \brief Build the WS/WSS URL clients should connect to for this peer */
 char *janus_rtp_ws_peer_build_url(janus_rtp_ws_peer *peer);
 /*! \brief Queue an RTP packet for delivery to the peer over WebSocket */

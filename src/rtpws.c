@@ -72,7 +72,8 @@ void janus_rtp_ws_deinit(void) {
 
 janus_rtp_ws_peer *janus_rtp_ws_peer_create(void *user_data,
 		janus_rtp_ws_incoming_rtp_cb incoming_rtp, janus_rtp_ws_client_gone_cb client_gone,
-		const char *codec_name, int sample_rate, int channels, int ptime_ms, int payload_type) {
+		const char *codec_name, int sample_rate, int channels, int ptime_ms, int payload_type,
+		gboolean payload_only) {
 	(void)user_data;
 	(void)incoming_rtp;
 	(void)client_gone;
@@ -81,6 +82,7 @@ janus_rtp_ws_peer *janus_rtp_ws_peer_create(void *user_data,
 	(void)channels;
 	(void)ptime_ms;
 	(void)payload_type;
+	(void)payload_only;
 	return NULL;
 }
 
@@ -127,6 +129,9 @@ typedef struct janus_rtp_ws_out_pkt {
 typedef struct janus_rtp_ws_in_pkt {
 	janus_rtp_ws_peer *peer;
 	int len;
+	/*! \brief TRUE when data is a raw codec payload (payload mode) that still
+	 * needs an RTP header synthesized before it's handed to the plugin. */
+	gboolean raw;
 	unsigned char data[RTP_WS_MAX_RTP];
 } janus_rtp_ws_in_pkt;
 
@@ -339,6 +344,7 @@ static void janus_rtp_ws_send_call_info(struct lws *wsi, janus_rtp_ws_peer *peer
 	json_object_set_new(info, "channels", json_integer(peer->channels > 0 ? peer->channels : 1));
 	json_object_set_new(info, "ptime_ms", json_integer(peer->ptime_ms > 0 ? peer->ptime_ms : 20));
 	json_object_set_new(info, "payload_type", json_integer(peer->payload_type > 0 ? peer->payload_type : 100));
+	json_object_set_new(info, "framing", json_string(peer->payload_only ? "payload" : "rtp"));
 	janus_rtp_ws_send_json(wsi, info);
 }
 
@@ -487,16 +493,25 @@ static int janus_rtp_ws_callback(struct lws *wsi, enum lws_callback_reasons reas
 			if(lws_frame_is_binary(wsi)) {
 				if(!conn->peer)
 					break;
-				if(len < 12 || len > RTP_WS_MAX_RTP)
-					break;
-				if(!janus_is_rtp((char *)in, (int)len))
-					break;
+				gboolean raw = conn->peer->payload_only;
+				if(raw) {
+					/* Raw codec payload: any non-empty frame that leaves room for a
+					 * synthesized RTP header once it reaches the delivery thread. */
+					if(len < 1 || len > (size_t)(RTP_WS_MAX_RTP - RTP_HEADER_SIZE))
+						break;
+				} else {
+					if(len < 12 || len > RTP_WS_MAX_RTP)
+						break;
+					if(!janus_is_rtp((char *)in, (int)len))
+						break;
+				}
 				if(g_atomic_int_get(&conn->peer->destroyed))
 					break;
 				janus_rtp_ws_in_pkt *pkt = g_malloc(sizeof(janus_rtp_ws_in_pkt));
 				pkt->peer = conn->peer;
 				janus_refcount_increase(&pkt->peer->ref);
 				pkt->len = (int)len;
+				pkt->raw = raw;
 				memcpy(pkt->data, in, len);
 				g_async_queue_push(rtp_ws_in_queue, pkt);
 				break;
@@ -545,14 +560,47 @@ static void *janus_rtp_ws_service_thread(void *data) {
 	return NULL;
 }
 
+/* Wrap a raw codec payload in a minimal RTP packet using the peer's synthesized
+ * seq/timestamp/SSRC state (payload framing mode, inbound). Called only from the
+ * single delivery thread, so the per-peer counters need no extra locking. */
+static int janus_rtp_ws_synthesize_rtp(janus_rtp_ws_peer *peer, const unsigned char *payload,
+		int plen, char *out, int out_cap) {
+	if(!peer || !payload || plen <= 0 || out_cap < RTP_HEADER_SIZE + plen)
+		return -1;
+	rtp_header *h = (rtp_header *)out;
+	memset(h, 0, RTP_HEADER_SIZE);
+	h->version = 2;
+	h->type = (uint16_t)(peer->payload_type & 0x7F);
+	h->markerbit = peer->synth_started ? 0 : 1;
+	h->seq_number = htons(peer->synth_seq++);
+	h->timestamp = htonl(peer->synth_ts);
+	h->ssrc = htonl(peer->synth_ssrc);
+	int samples = peer->sample_rate * peer->ptime_ms / 1000;
+	if(samples <= 0)
+		samples = plen;
+	peer->synth_ts += (guint32)samples;
+	peer->synth_started = TRUE;
+	memcpy(out + RTP_HEADER_SIZE, payload, plen);
+	return RTP_HEADER_SIZE + plen;
+}
+
 static void *janus_rtp_ws_delivery_thread(void *data) {
 	(void)data;
 	while(rtp_ws_delivery_running || g_async_queue_length(rtp_ws_in_queue) > 0) {
 		janus_rtp_ws_in_pkt *pkt = g_async_queue_timeout_pop(rtp_ws_in_queue, 100 * G_TIME_SPAN_MILLISECOND);
 		if(!pkt)
 			continue;
-		if(!g_atomic_int_get(&pkt->peer->destroyed) && pkt->peer->incoming_rtp)
-			pkt->peer->incoming_rtp(pkt->peer, (char *)pkt->data, pkt->len);
+		if(!g_atomic_int_get(&pkt->peer->destroyed) && pkt->peer->incoming_rtp) {
+			if(pkt->raw) {
+				char rtpbuf[RTP_HEADER_SIZE + RTP_WS_MAX_RTP];
+				int rlen = janus_rtp_ws_synthesize_rtp(pkt->peer, pkt->data, pkt->len,
+					rtpbuf, sizeof(rtpbuf));
+				if(rlen > 0)
+					pkt->peer->incoming_rtp(pkt->peer, rtpbuf, rlen);
+			} else {
+				pkt->peer->incoming_rtp(pkt->peer, (char *)pkt->data, pkt->len);
+			}
+		}
 		janus_rtp_ws_in_pkt_free(pkt);
 	}
 	return NULL;
@@ -691,7 +739,8 @@ static void janus_rtp_ws_peer_free(const janus_refcount *p_ref) {
 
 janus_rtp_ws_peer *janus_rtp_ws_peer_create(void *user_data,
 		janus_rtp_ws_incoming_rtp_cb incoming_rtp, janus_rtp_ws_client_gone_cb client_gone,
-		const char *codec_name, int sample_rate, int channels, int ptime_ms, int payload_type) {
+		const char *codec_name, int sample_rate, int channels, int ptime_ms, int payload_type,
+		gboolean payload_only) {
 	if(!rtp_ws_enabled || !rtp_ws_peers_by_sid || !incoming_rtp)
 		return NULL;
 	janus_rtp_ws_peer *peer = g_malloc0(sizeof(janus_rtp_ws_peer));
@@ -703,6 +752,12 @@ janus_rtp_ws_peer *janus_rtp_ws_peer_create(void *user_data,
 	peer->channels = channels > 0 ? channels : 1;
 	peer->ptime_ms = ptime_ms > 0 ? ptime_ms : 20;
 	peer->payload_type = payload_type > 0 ? payload_type : 100;
+	peer->payload_only = payload_only;
+	/* Seed the synthesized RTP stream (inbound raw payloads) with random state. */
+	peer->synth_ssrc = g_random_int();
+	peer->synth_seq = (guint16)g_random_int_range(0, 65536);
+	peer->synth_ts = g_random_int();
+	peer->synth_started = FALSE;
 	peer->session_id = janus_rtp_ws_random_sid();
 	janus_refcount_init(&peer->ref, janus_rtp_ws_peer_free);
 	janus_refcount_increase(&peer->ref);
@@ -732,10 +787,22 @@ int janus_rtp_ws_peer_send_rtp(janus_rtp_ws_peer *peer, const char *rtp, int len
 	if(!extra)
 		return -1;
 
+	const char *out = rtp;
+	int out_len = len;
+	if(peer->payload_only) {
+		/* Ship just the codec payload; drop the RTP header (and any CSRC/extension). */
+		int plen = 0;
+		char *payload = janus_rtp_payload((char *)rtp, len, &plen);
+		if(!payload || plen <= 0)
+			return -1;
+		out = payload;
+		out_len = plen;
+	}
+
 	janus_rtp_ws_out_pkt *pkt = g_malloc(sizeof(janus_rtp_ws_out_pkt));
-	pkt->len = len;
-	pkt->data = g_malloc(len);
-	memcpy(pkt->data, rtp, len);
+	pkt->len = out_len;
+	pkt->data = g_malloc(out_len);
+	memcpy(pkt->data, out, out_len);
 
 	janus_mutex_lock(&extra->mutex);
 	g_async_queue_push(extra->out_queue, pkt);

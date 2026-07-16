@@ -910,7 +910,9 @@ room-<unique room ID>: {
 	"audio_level_average" : "<if provided, overrides the room audio_level_average for this user; optional>",
 	"audio_active_packets" : "<if provided, overrides the room audio_active_packets for this user; optional>",
 	"record": <true|false, whether to record this user's contribution to a .mjr file (mixer not involved)>,
-	"filename": "<basename of the file to record to, -audio.mjr will be added by the plugin; will be relative to mjrs_dir, if configured in the room>"
+	"filename": "<basename of the file to record to, -audio.mjr will be added by the plugin; will be relative to mjrs_dir, if configured in the room>",
+	"media" : "<set to \"websocket\" to join as an RTP-over-WebSocket participant (requires rtpws support and allow_ws_participants); optional>",
+	"ws_framing" : "<for media=websocket only: \"rtp\" (default, full RTP packets) or \"payload\" (raw codec payloads, for external AI/STT/TTS clients)>"
 }
 \endverbatim
  *
@@ -1441,6 +1443,8 @@ static struct janus_json_parameter join_parameters[] = {
 	{"filename", JSON_STRING, 0},
 	{"generate_offer", JANUS_JSON_BOOL, 0},
 	{"rtp", JSON_OBJECT, 0},
+	{"media", JSON_STRING, 0},
+	{"ws_framing", JSON_STRING, 0},
 	{"secret", JSON_STRING, 0}
 };
 static struct janus_json_parameter record_parameters[] = {
@@ -7244,9 +7248,16 @@ static void *janus_audiobridge_handler(void *data) {
 				int ws_sample_rate = 0, ws_payload_type = 0;
 				janus_audiobridge_rtp_ws_media_params(participant, audiobridge,
 					&ws_codec_name, &ws_sample_rate, &ws_payload_type);
+				/* Optional framing: "rtp" (default, full RTP packets) or "payload"
+				 * (raw codec payloads, for external AI/STT/TTS clients). */
+				gboolean ws_payload_only = FALSE;
+				json_t *ws_framing = json_object_get(root, "ws_framing");
+				if(ws_framing && json_is_string(ws_framing) &&
+						!strcasecmp(json_string_value(ws_framing), "payload"))
+					ws_payload_only = TRUE;
 				participant->rtp_ws_peer = janus_rtp_ws_peer_create(session,
 					janus_audiobridge_rtp_ws_incoming, NULL, ws_codec_name,
-					ws_sample_rate, 1, 20, ws_payload_type);
+					ws_sample_rate, 1, 20, ws_payload_type, ws_payload_only);
 				if(!participant->rtp_ws_peer) {
 					error_code = 499;
 					g_snprintf(error_cause, 512, "Failed to allocate WebSocket media session");
