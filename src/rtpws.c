@@ -26,6 +26,10 @@
 
 #define RTP_WS_SID_BYTES 16
 #define RTP_WS_MAX_RTP 1500
+/* Cap on packets waiting to go out on a peer's WebSocket. Media is real-time and
+ * lossy: anything older than this is stale by the time the socket drains, so we
+ * discard the oldest instead of growing the queue without bound. */
+#define RTP_WS_MAX_OUT_QUEUE 200
 
 static gboolean rtp_ws_enabled = FALSE;
 
@@ -143,11 +147,17 @@ typedef struct janus_rtp_ws_peer_extra {
 	size_t write_buf_alloc;
 	size_t write_pending;
 	size_t write_offset;
+	guint64 dropped;
 } janus_rtp_ws_peer_extra;
 
-static GHashTable *rtp_ws_peer_extras = NULL;
-static janus_mutex rtp_ws_extras_mutex = JANUS_MUTEX_INITIALIZER;
 static GAsyncQueue *rtp_ws_in_queue = NULL;
+/* Peers with queued output waiting to be marked writable. libwebsockets is not
+ * thread-safe: lws_cancel_service() is the only call we may make from another
+ * thread, so foreign threads park the peer here and the service thread does the
+ * actual lws_callback_on_writable() when it wakes up. Each entry owns a peer
+ * reference, so a peer parked here cannot be freed before we look at it. */
+static GHashTable *rtp_ws_writable_peers = NULL;
+static janus_mutex rtp_ws_writable_mutex = JANUS_MUTEX_INITIALIZER;
 
 typedef struct janus_rtp_ws_connection {
 	struct lws *wsi;
@@ -160,22 +170,17 @@ static void janus_rtp_ws_in_pkt_free(gpointer data);
 static void janus_rtp_ws_peer_unref(janus_rtp_ws_peer *peer);
 static void janus_rtp_ws_peer_free(const janus_refcount *p_ref);
 
+/* The extra is owned by the peer and freed with it, so it's safe to use without
+ * further locking for as long as the caller holds a reference to the peer. */
 static janus_rtp_ws_peer_extra *janus_rtp_ws_extra_get(janus_rtp_ws_peer *peer) {
-	if(!peer || !rtp_ws_peer_extras)
-		return NULL;
-	janus_mutex_lock(&rtp_ws_extras_mutex);
-	janus_rtp_ws_peer_extra *extra = g_hash_table_lookup(rtp_ws_peer_extras, peer);
-	janus_mutex_unlock(&rtp_ws_extras_mutex);
-	return extra;
+	return peer ? (janus_rtp_ws_peer_extra *)peer->extra : NULL;
 }
 
 static janus_rtp_ws_peer_extra *janus_rtp_ws_extra_create(janus_rtp_ws_peer *peer) {
 	janus_rtp_ws_peer_extra *extra = g_malloc0(sizeof(janus_rtp_ws_peer_extra));
 	janus_mutex_init(&extra->mutex);
 	extra->out_queue = g_async_queue_new_full((GDestroyNotify)janus_rtp_ws_out_pkt_free);
-	janus_mutex_lock(&rtp_ws_extras_mutex);
-	g_hash_table_insert(rtp_ws_peer_extras, peer, extra);
-	janus_mutex_unlock(&rtp_ws_extras_mutex);
+	peer->extra = extra;
 	return extra;
 }
 
@@ -211,11 +216,46 @@ static void janus_rtp_ws_extra_destroy(gpointer data) {
 	g_free(extra);
 }
 
-static void janus_rtp_ws_request_writable(janus_rtp_ws_peer_extra *extra) {
-	if(!extra || !extra->wsi || !rtp_ws_context)
+/* Discard anything still queued for a connection that's gone. Call with the
+ * extra's mutex held. */
+static void janus_rtp_ws_extra_drain(janus_rtp_ws_peer_extra *extra) {
+	if(!extra || !extra->out_queue)
 		return;
-	lws_callback_on_writable(extra->wsi);
+	janus_rtp_ws_out_pkt *pkt = NULL;
+	while((pkt = g_async_queue_try_pop(extra->out_queue)) != NULL)
+		janus_rtp_ws_out_pkt_free(pkt);
+	extra->write_pending = 0;
+	extra->write_offset = 0;
+}
+
+/* Ask for a writable callback from any thread. We only touch lws_cancel_service()
+ * here, which is the one libwebsockets entry point that's safe off-thread; the
+ * service thread turns this into lws_callback_on_writable() when it wakes up.
+ * Must be called without the peer's extra mutex held (see the lock order note in
+ * the LWS_CALLBACK_EVENT_WAIT_CANCELLED handler). */
+static void janus_rtp_ws_request_writable(janus_rtp_ws_peer *peer) {
+	if(!peer || !rtp_ws_context)
+		return;
+#if (LWS_LIBRARY_VERSION_MAJOR >= 3)
+	janus_mutex_lock(&rtp_ws_writable_mutex);
+	if(rtp_ws_writable_peers && !g_hash_table_contains(rtp_ws_writable_peers, peer)) {
+		janus_refcount_increase(&peer->ref);
+		g_hash_table_add(rtp_ws_writable_peers, peer);
+	}
+	janus_mutex_unlock(&rtp_ws_writable_mutex);
 	lws_cancel_service(rtp_ws_context);
+#else
+	/* No LWS_CALLBACK_EVENT_WAIT_CANCELLED before libwebsockets 3.x, so there's no
+	 * way to hand this to the service thread: mark it directly, as the core
+	 * WebSocket transport also does on these versions. */
+	janus_rtp_ws_peer_extra *extra = janus_rtp_ws_extra_get(peer);
+	if(extra) {
+		janus_mutex_lock(&extra->mutex);
+		if(extra->wsi)
+			lws_callback_on_writable(extra->wsi);
+		janus_mutex_unlock(&extra->mutex);
+	}
+#endif
 }
 
 static int janus_rtp_ws_flush_writable(janus_rtp_ws_connection *conn, struct lws *wsi) {
@@ -379,7 +419,8 @@ static int janus_rtp_ws_attach_peer(janus_rtp_ws_connection *conn, struct lws *w
 		janus_mutex_lock(&extra->mutex);
 		extra->wsi = wsi;
 		janus_mutex_unlock(&extra->mutex);
-		janus_rtp_ws_request_writable(extra);
+		/* We're on the service thread here, so we can arm this directly */
+		lws_callback_on_writable(wsi);
 	}
 	janus_rtp_ws_send_call_info(wsi, peer);
 	return 0;
@@ -478,7 +519,8 @@ static int janus_rtp_ws_callback(struct lws *wsi, enum lws_callback_reasons reas
 					janus_mutex_lock(&extra->mutex);
 					extra->wsi = wsi;
 					janus_mutex_unlock(&extra->mutex);
-					janus_rtp_ws_request_writable(extra);
+					/* We're on the service thread here, so we can arm this directly */
+					lws_callback_on_writable(wsi);
 				}
 				janus_rtp_ws_send_call_info(wsi, conn->peer);
 			} else if(conn && rtp_ws_allow_bind) {
@@ -523,6 +565,39 @@ static int janus_rtp_ws_callback(struct lws *wsi, enum lws_callback_reasons reas
 		case LWS_CALLBACK_SERVER_WRITEABLE:
 			janus_rtp_ws_flush_writable(conn, wsi);
 			break;
+#if (LWS_LIBRARY_VERSION_MAJOR >= 3)
+		case LWS_CALLBACK_EVENT_WAIT_CANCELLED: {
+			/* Another thread queued output and woke us up: arm the writable callback
+			 * for each peer it flagged, now that we're on the service thread.
+			 * We steal the set first so we never hold rtp_ws_writable_mutex while
+			 * taking a peer's extra mutex: senders take them in the opposite order,
+			 * and nesting them here would invert the lock order. Stealing also keeps
+			 * the peer references the set was holding, so they stay alive below. */
+			GList *pending = NULL;
+			janus_mutex_lock(&rtp_ws_writable_mutex);
+			if(rtp_ws_writable_peers != NULL) {
+				pending = g_hash_table_get_keys(rtp_ws_writable_peers);
+				g_hash_table_steal_all(rtp_ws_writable_peers);
+			}
+			janus_mutex_unlock(&rtp_ws_writable_mutex);
+			GList *item = NULL;
+			for(item = pending; item != NULL; item = item->next) {
+				janus_rtp_ws_peer *peer = (janus_rtp_ws_peer *)item->data;
+				janus_rtp_ws_peer_extra *extra = janus_rtp_ws_extra_get(peer);
+				struct lws *peer_wsi = NULL;
+				if(extra) {
+					janus_mutex_lock(&extra->mutex);
+					peer_wsi = extra->wsi;
+					janus_mutex_unlock(&extra->mutex);
+				}
+				if(peer_wsi != NULL)
+					lws_callback_on_writable(peer_wsi);
+				janus_rtp_ws_peer_unref(peer);
+			}
+			g_list_free(pending);
+			break;
+		}
+#endif
 		case LWS_CALLBACK_CLOSED:
 			if(conn) {
 				conn->closing = 1;
@@ -531,8 +606,9 @@ static int janus_rtp_ws_callback(struct lws *wsi, enum lws_callback_reasons reas
 					if(extra) {
 						janus_mutex_lock(&extra->mutex);
 						extra->wsi = NULL;
-						extra->write_pending = 0;
-						extra->write_offset = 0;
+						/* Discard whatever was still queued: it can never be sent on
+						 * this connection, and holding it would leak until peer destroy. */
+						janus_rtp_ws_extra_drain(extra);
 						janus_mutex_unlock(&extra->mutex);
 					}
 					if(conn->peer->client_gone)
@@ -627,7 +703,9 @@ int janus_rtp_ws_init(gboolean enabled, uint16_t port, const char *path, const c
 		return 0;
 
 	rtp_ws_peers_by_sid = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-	rtp_ws_peer_extras = g_hash_table_new_full(NULL, NULL, NULL, janus_rtp_ws_extra_destroy);
+	/* Key destructor drops the peer reference each pending entry holds */
+	rtp_ws_writable_peers = g_hash_table_new_full(NULL, NULL,
+		(GDestroyNotify)janus_rtp_ws_peer_unref, NULL);
 	rtp_ws_in_queue = g_async_queue_new_full((GDestroyNotify)janus_rtp_ws_in_pkt_free);
 
 	struct lws_context_creation_info info;
@@ -709,9 +787,11 @@ void janus_rtp_ws_deinit(void) {
 		g_hash_table_destroy(rtp_ws_peers_by_sid);
 		rtp_ws_peers_by_sid = NULL;
 	}
-	if(rtp_ws_peer_extras) {
-		g_hash_table_destroy(rtp_ws_peer_extras);
-		rtp_ws_peer_extras = NULL;
+	if(rtp_ws_writable_peers) {
+		janus_mutex_lock(&rtp_ws_writable_mutex);
+		g_hash_table_destroy(rtp_ws_writable_peers);
+		rtp_ws_writable_peers = NULL;
+		janus_mutex_unlock(&rtp_ws_writable_mutex);
 	}
 	rtp_ws_enabled = FALSE;
 }
@@ -733,6 +813,9 @@ static void janus_rtp_ws_peer_unref(janus_rtp_ws_peer *peer) {
 
 static void janus_rtp_ws_peer_free(const janus_refcount *p_ref) {
 	janus_rtp_ws_peer *peer = janus_refcount_containerof(p_ref, janus_rtp_ws_peer, ref);
+	/* Last reference is gone, so nobody can be using the connection state anymore */
+	janus_rtp_ws_extra_destroy(peer->extra);
+	peer->extra = NULL;
 	g_free(peer->session_id);
 	g_free(peer);
 }
@@ -759,8 +842,10 @@ janus_rtp_ws_peer *janus_rtp_ws_peer_create(void *user_data,
 	peer->synth_ts = g_random_int();
 	peer->synth_started = FALSE;
 	peer->session_id = janus_rtp_ws_random_sid();
+	/* janus_refcount_init() already sets the counter to 1: that reference belongs
+	 * to the caller and is released by janus_rtp_ws_peer_destroy(). The sid table
+	 * entry below is a borrowed pointer, removed under the same lock as lookups. */
 	janus_refcount_init(&peer->ref, janus_rtp_ws_peer_free);
-	janus_refcount_increase(&peer->ref);
 	janus_rtp_ws_extra_create(peer);
 	janus_mutex_lock(&rtp_ws_peers_mutex);
 	g_hash_table_insert(rtp_ws_peers_by_sid, g_strdup(peer->session_id), peer);
@@ -799,16 +884,37 @@ int janus_rtp_ws_peer_send_rtp(janus_rtp_ws_peer *peer, const char *rtp, int len
 		out_len = plen;
 	}
 
+	janus_mutex_lock(&extra->mutex);
+	if(!extra->wsi || !extra->out_queue) {
+		/* No client on the other end: there's nothing to drain the queue, so
+		 * queueing here would grow without bound for as long as the peer lives. */
+		janus_mutex_unlock(&extra->mutex);
+		return -1;
+	}
+	/* Client is attached but not keeping up: drop the oldest packets so the
+	 * stream stays current (and bounded) rather than accumulating stale audio. */
+	while(g_async_queue_length(extra->out_queue) >= RTP_WS_MAX_OUT_QUEUE) {
+		janus_rtp_ws_out_pkt *old = g_async_queue_try_pop(extra->out_queue);
+		if(!old)
+			break;
+		janus_rtp_ws_out_pkt_free(old);
+		extra->dropped++;
+		if(extra->dropped == 1 || (extra->dropped % 500) == 0) {
+			JANUS_LOG(LOG_WARN, "[RTP-WS] Outgoing queue full, dropping packets (%"G_GUINT64_FORMAT" so far)\n",
+				extra->dropped);
+		}
+	}
+
 	janus_rtp_ws_out_pkt *pkt = g_malloc(sizeof(janus_rtp_ws_out_pkt));
 	pkt->len = out_len;
 	pkt->data = g_malloc(out_len);
 	memcpy(pkt->data, out, out_len);
 
-	janus_mutex_lock(&extra->mutex);
 	g_async_queue_push(extra->out_queue, pkt);
-	if(extra->wsi)
-		janus_rtp_ws_request_writable(extra);
 	janus_mutex_unlock(&extra->mutex);
+	/* Signal after unlocking: the service thread needs the extra mutex to pick
+	 * this up, and holding both here would invert the lock order. */
+	janus_rtp_ws_request_writable(peer);
 	return 0;
 }
 
@@ -820,9 +926,16 @@ void janus_rtp_ws_peer_destroy(janus_rtp_ws_peer *peer) {
 		g_hash_table_remove(rtp_ws_peers_by_sid, peer->session_id);
 		janus_mutex_unlock(&rtp_ws_peers_mutex);
 	}
-	janus_mutex_lock(&rtp_ws_extras_mutex);
-	g_hash_table_remove(rtp_ws_peer_extras, peer);
-	janus_mutex_unlock(&rtp_ws_extras_mutex);
+	/* Release the queued media now rather than waiting for the last reference: the
+	 * service thread may still hold one for an open connection. We don't free the
+	 * connection state here, since that thread may be using it right now; it goes
+	 * away with the peer itself. */
+	janus_rtp_ws_peer_extra *extra = janus_rtp_ws_extra_get(peer);
+	if(extra) {
+		janus_mutex_lock(&extra->mutex);
+		janus_rtp_ws_extra_drain(extra);
+		janus_mutex_unlock(&extra->mutex);
+	}
 	janus_rtp_ws_peer_unref(peer);
 }
 

@@ -80,6 +80,11 @@ typedef struct janus_rtp_ws_peer {
 	gboolean synth_started;
 	janus_rtp_ws_incoming_rtp_cb incoming_rtp;
 	janus_rtp_ws_client_gone_cb client_gone;
+	/*! \brief Core-private connection state (libwebsockets handle, outgoing queue).
+	 * Opaque here so plugins don't need the libwebsockets headers; its lifetime is
+	 * tied to this peer's reference count, so it stays valid for as long as you
+	 * hold a reference to the peer. Plugins must not touch it. */
+	void *extra;
 	/*! \brief Atomic flag to check if this instance has been destroyed */
 	volatile gint destroyed;
 	/*! \brief Reference counter for this instance */
