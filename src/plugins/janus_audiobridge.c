@@ -9737,9 +9737,8 @@ static void janus_audiobridge_relay_rtp_packet(gpointer data, gpointer user_data
 			}
 		}
 	} else if(participant->wsmedia && participant->rtp_ws_peer) {
-		/* Only keep the session alive while a client is actually attached: touching it
-		 * unconditionally would let our own mixer output renew the session forever, so
-		 * a participant whose WebSocket went away would never be reaped. */
+		/* Only touch the session when a client is attached: renewing it from our own
+		 * mixer output would keep an abandoned participant alive forever */
 		if(janus_rtp_ws_peer_send_rtp(participant->rtp_ws_peer, (char *)packet->data, packet->length) == 0 &&
 				gateway != NULL)
 			gateway->touch_session(session->handle);
